@@ -230,9 +230,9 @@ def mr_ref(m):
     return (m.get("references") or {}).get("full") or f"!{m.get('iid', '?')}"
 
 
-def build_evening_prompt(day, jal, rel, commits, merged_mrs, touched_mrs, session_lines):
-    lines = [f"Reconcile today's Obsidian worklog. Today is {day.isoformat()} = Jalali {jal} "
-             f"(his work week is Sunday–Thursday).",
+def build_evening_prompt(day, jal, rel, commits, merged_mrs, touched_mrs, transcripts_block):
+    lines = [f"Reconcile today's Obsidian worklog AND map it against what actually happened today. "
+             f"Today is {day.isoformat()} = Jalali {jal} (his work week is Sunday–Thursday).",
              f"Worklog file, relative to the vault root {VAULT}: `{rel}`",
              "", "Facts already gathered for you — ground truth, do not re-derive them:", "",
              "Commits authored today:"]
@@ -241,33 +241,73 @@ def build_evening_prompt(day, jal, rel, commits, merged_mrs, touched_mrs, sessio
     lines += [f"- {mr_ref(m)} {m['title']}" for m in merged_mrs] if merged_mrs else ["- (none)"]
     lines += ["", "MRs opened/updated today, not yet merged:"]
     lines += [f"- {mr_ref(m)} {m['title']} ({m['state']})" for m in touched_mrs] if touched_mrs else ["- (none)"]
-    lines += ["", "Session activity today — real investigation/discussion time, even where nothing landed as a commit:"]
-    lines += session_lines if session_lines else ["- (no session activity logged)"]
+    lines += ["", "Condensed transcripts of today's substantial sessions — his messages and the assistant's replies, "
+                   "real content, not just topic labels. This is what he actually worked on, discussed, or "
+                   "investigated today, use it to know what really happened:", "", transcripts_block]
     lines += ["", (
         "Steps:\n"
-        "1. Read the worklog file if it exists. If not, create it: look at a recent worklog in the same month "
-        "folder for the format (a 'Main tasks' heading then a checklist), and if this week's Sunday check-in "
-        "file exists, seed the list from its still-open items.\n"
+        "1. Read the worklog file if it exists — this morning's planned checklist. If it doesn't exist, create it: "
+        "look at a recent worklog in the same month folder for the format (a 'Main tasks' heading then a "
+        "checklist), and if this week's Sunday check-in file exists, seed the list from its still-open items.\n"
         "2. Tick `- [ ]` to `- [x]` only where a commit or merged MR clearly supports it — never on a guess, "
         "and never from session activity alone.\n"
         "3. If real work happened today with no matching line: a commit/MR with no line gets appended ticked, "
         "marked `- [x] (unplanned) <what>`. Session activity with no commit and no matching line gets appended "
-        "UNTICKED, marked `- [ ] (session) <what, ~Xh>` — it records that real time went somewhere, without "
-        "claiming it's done. Skip trivial or one-line sessions; only log ones with real substance.\n"
+        "UNTICKED, marked `- [ ] (session) <what, ~Xh>`. Skip trivial or one-line sessions; only log ones with "
+        "real substance.\n"
         "4. Leave every other line untouched. Never delete or reword an existing line. Never touch any file "
         "other than this one worklog.\n"
         f"5. If the file actually changed: `git -C {VAULT} add -A -- \"{rel}\"`, commit with message "
         f"`evening close: {jal} ({day.isoformat()})`. If nothing changed, skip the commit.\n"
         f"6. Always end with `git -C {VAULT} push`, whether or not you just committed — an earlier run may have "
         "committed locally without managing to push. If the push fails, say so plainly; do not claim success.\n"
-        "7. Reply with a short recap: what was ticked, what was added, what stayed open, and the push result."
+        "7. Now build a TASK MAP — this is the whole point of the run, read the transcripts above properly, "
+        "don't skim. For EVERY planned item in the worklog (every `- [ ]`/`- [x]` line from the ORIGINAL file, "
+        "before your edits — including ones you just touched), write one line matching it against what the "
+        "session transcripts show actually happened. Judge from real content, not from whether a line got "
+        "ticked:\n"
+        "   ✅ <task text, short> — <one clause: what actually got done>\n"
+        "   🔸 <task text, short> — in progress: <one clause: what happened, what's left>\n"
+        "   ➖ <task text, short> — no activity today\n"
+        "   If substantial work happened that matches NO planned line, add a final block (blank line before it) "
+        "of 🆕 lines, same one-clause style, for that unplanned work only.\n"
+        "8. Reply with ONLY the task map from step 7. No preamble, no push recap, no worklog commentary, "
+        "nothing before or after it. If the worklog has no planned items and no substantial activity happened, "
+        "reply with exactly: No planned items and no substantial activity today."
     )]
     return "\n".join(lines)
 
 
 EVENING_SYSTEM_PROMPT = ("You are running unattended from a Discord bot's evening-close job. Never ask questions. "
-                        "Only tick an item when a commit or MR clearly supports it. Only touch the one worklog "
-                        "file and vault git plumbing — never any other file, never any other repo.")
+                        "Only tick a worklog item when a commit or MR clearly supports it. Only touch the one "
+                        "worklog file and vault git plumbing — never any other file, never any other repo. Your "
+                        "final reply must be ONLY the task map (step 7/8) — no other text.")
+
+
+def session_excerpt(msgs, sid, today_iso, max_msgs=14, max_chars=900):
+    """Real conversation content for one session, today's slice only, cleaned of command/wrapper
+    noise — this is what lets the model judge what ACTUALLY happened, not just a topic label."""
+    mine = sorted((m for m in msgs if m["sid"] == sid and m["d"] == today_iso and not wr.INJECTED(m["text"])), key=lambda m: m["t"])
+    lines, total = [], 0
+    for m in mine[:max_msgs]:
+        text = " ".join(m["text"].split())[:220]
+        if not text:
+            continue
+        line = f"{'You' if m['role'] == 'user' else 'Assistant'}: {text}"
+        if total + len(line) > max_chars:
+            break
+        lines.append(line); total += len(line)
+    return "\n".join(lines)
+
+
+def transcripts_for(daily, msgs, today_iso, cap=8):
+    rows = sorted((r for r in daily["ledger"] if r["hours"] > 0.03 or r["msgs"] >= 3), key=lambda r: -r["hours"])[:cap]
+    blocks = []
+    for r in rows:
+        text = "\n\n".join(filter(None, (session_excerpt(msgs, sid, today_iso) for sid in r["sids"])))
+        if text:
+            blocks.append(f"--- {r['what'][:70]} (~{r['hours']:.2g}h) ---\n{text}")
+    return "\n\n".join(blocks) if blocks else "(no substantial session content today)"
 
 
 def bar_ascii(pct, width=14):
@@ -286,19 +326,6 @@ def category_block(wall, tot):
         pct = v / tot * 100
         lines.append(f"{wr.SHORT[c]:<3}{bar_ascii(pct)} {pct:>3.0f}%  {wr.h(v / 60)}")
     return "\n".join(lines)
-
-
-CAT_EMOJI = {"maintenance": "🐞", "reliability": "🛠️", "feature": "✨", "workspace": "🧰"}
-
-
-def session_lines_for(daily, cap=10):
-    rows = [r for r in daily["ledger"] if r["hours"] > 0.03 or r["msgs"] >= 3]
-    rows.sort(key=lambda r: -r["hours"])
-    out = []
-    for r in rows[:cap]:
-        label = r["ref"] if r["ref"].startswith("RS-") else r["what"][:80]
-        out.append(f"- [{wr.SHORT.get(r['cat'], r['cat'])}] {label} (~{r['hours']:.2g}h, {r['msgs']} msgs)")
-    return out
 
 
 async def run_evening_close(dest, day=None):
@@ -331,7 +358,7 @@ async def run_evening_close(dest, day=None):
         merged = [x for x in mrs_all if wr.tehran_date(x.get("merged_at") or "") == since]
         touched = [x for x in mrs_all if x.get("state") == "opened" and wr.tehran_date(x.get("updated_at") or "") == since]
         before = await asyncio.to_thread(vault_head)
-        prompt = build_evening_prompt(day, jal, rel, commits, merged, touched, session_lines_for(daily))
+        prompt = build_evening_prompt(day, jal, rel, commits, merged, touched, transcripts_for(daily, msgs, since))
         async with dest.typing():
             result, err = await claude_run(prompt, VAULT_WRITE_TOOLS, QA_TIMEOUT, BOT_DIR, extra=["--append-system-prompt", EVENING_SYSTEM_PROMPT])
         after = await asyncio.to_thread(vault_head)
@@ -362,13 +389,10 @@ async def run_evening_close(dest, day=None):
         desc.append(f"No session activity logged · {daily['kpis']['commits']} commits · {len(merged)} merged / {len(touched)} open")
     e = discord.Embed(title=f"🌙 Evening Close — {jal}", description="\n".join(desc), color=color)
 
-    if daily["ledger"]:
-        rows = sorted(daily["ledger"], key=lambda r: -r["hours"])[:6]
-        lines = [f"{CAT_EMOJI.get(r['cat'], '•')} {(r['ref'] if r['ref'].startswith('RS-') else r['what'][:55])}" + (f" — {wr.h(r['hours'])}" if r["hours"] > 0.01 else "") for r in rows]
-        extra = len(daily["ledger"]) - len(rows)
-        if extra > 0:
-            lines.append(f"_+{extra} more_")
-        e.add_field(name="🧵 Threads today", value="\n".join(lines)[:1024], inline=False)
+    # Primary content: the model's plan-vs-actual read of today's real conversations, not a
+    # mechanical ledger dump. Trusted verbatim — its own instructions constrain the format tightly.
+    taskmap = (result or "").strip() or "_(no task map produced)_"
+    e.add_field(name="🗺️ Task Map", value=taskmap[:1024], inline=False)
 
     if daily["commits"]:
         by_repo = collections.Counter(c["repo"] for c in daily["commits"])
@@ -379,8 +403,9 @@ async def run_evening_close(dest, day=None):
         lines = [f"✅ {mr_ref(m)} {m['title'][:45]}" for m in merged[:4]] + [f"🟡 {mr_ref(m)} {m['title'][:45]}" for m in touched[:4]]
         e.add_field(name="🔀 Merge requests", value="\n".join(lines)[:1024], inline=True)
 
-    # Worklog field is built from the git-diff ground truth (`added`), never from the model's own
-    # "I ticked X" narrative — same discipline as the diff-stat embed this replaces.
+    # Secondary field: what actually got WRITTEN to the vault file, from the git-diff ground truth
+    # (`added`) — never from the model's own "I ticked X" narrative. The Task Map above is the
+    # comprehension-based read; this is the mechanical proof of what landed on disk.
     if not changed:
         wl = "No changes." if pushed is not False else "No changes this run — an earlier commit is still unpushed."
     else:
@@ -394,7 +419,7 @@ async def run_evening_close(dest, day=None):
             else:
                 checklist.append(ls)
         wl = "\n".join(checklist)[:1024] or "_(see vault)_"
-    e.add_field(name="📓 Worklog", value=wl, inline=False)
+    e.add_field(name="📓 Worklog diff", value=wl, inline=False)
 
     if pushed is False:
         e.add_field(name="⚠️ Not pushed", value="Committed locally, but the push didn't reach GitHub — the vault deploy key is likely still read-only.", inline=False)
