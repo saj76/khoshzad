@@ -230,7 +230,7 @@ def mr_ref(m):
     return (m.get("references") or {}).get("full") or f"!{m.get('iid', '?')}"
 
 
-def build_evening_prompt(day, jal, rel, commits, merged_mrs, touched_mrs):
+def build_evening_prompt(day, jal, rel, commits, merged_mrs, touched_mrs, session_lines):
     lines = [f"Reconcile today's Obsidian worklog. Today is {day.isoformat()} = Jalali {jal} "
              f"(his work week is Sunday–Thursday).",
              f"Worklog file, relative to the vault root {VAULT}: `{rel}`",
@@ -241,14 +241,19 @@ def build_evening_prompt(day, jal, rel, commits, merged_mrs, touched_mrs):
     lines += [f"- {mr_ref(m)} {m['title']}" for m in merged_mrs] if merged_mrs else ["- (none)"]
     lines += ["", "MRs opened/updated today, not yet merged:"]
     lines += [f"- {mr_ref(m)} {m['title']} ({m['state']})" for m in touched_mrs] if touched_mrs else ["- (none)"]
+    lines += ["", "Session activity today — real investigation/discussion time, even where nothing landed as a commit:"]
+    lines += session_lines if session_lines else ["- (no session activity logged)"]
     lines += ["", (
         "Steps:\n"
         "1. Read the worklog file if it exists. If not, create it: look at a recent worklog in the same month "
         "folder for the format (a 'Main tasks' heading then a checklist), and if this week's Sunday check-in "
         "file exists, seed the list from its still-open items.\n"
-        "2. Tick `- [ ]` to `- [x]` only where a commit or merged MR clearly supports it — never on a guess.\n"
-        "3. If real work happened today with no matching line, append it as a new item, ticked, marked "
-        "distinctly: `- [x] (unplanned) <what>`.\n"
+        "2. Tick `- [ ]` to `- [x]` only where a commit or merged MR clearly supports it — never on a guess, "
+        "and never from session activity alone.\n"
+        "3. If real work happened today with no matching line: a commit/MR with no line gets appended ticked, "
+        "marked `- [x] (unplanned) <what>`. Session activity with no commit and no matching line gets appended "
+        "UNTICKED, marked `- [ ] (session) <what, ~Xh>` — it records that real time went somewhere, without "
+        "claiming it's done. Skip trivial or one-line sessions; only log ones with real substance.\n"
         "4. Leave every other line untouched. Never delete or reword an existing line. Never touch any file "
         "other than this one worklog.\n"
         f"5. If the file actually changed: `git -C {VAULT} add -A -- \"{rel}\"`, commit with message "
@@ -265,6 +270,16 @@ EVENING_SYSTEM_PROMPT = ("You are running unattended from a Discord bot's evenin
                         "file and vault git plumbing — never any other file, never any other repo.")
 
 
+def session_lines_for(daily, cap=10):
+    rows = [r for r in daily["ledger"] if r["hours"] > 0.03 or r["msgs"] >= 3]
+    rows.sort(key=lambda r: -r["hours"])
+    out = []
+    for r in rows[:cap]:
+        label = r["ref"] if r["ref"].startswith("RS-") else r["what"][:80]
+        out.append(f"- [{wr.SHORT.get(r['cat'], r['cat'])}] {label} (~{r['hours']:.2g}h, {r['msgs']} msgs)")
+    return out
+
+
 async def run_evening_close(dest, day=None):
     if run_lock.locked():
         await dest.send("Busy with another run — try again in a moment.")
@@ -278,41 +293,67 @@ async def run_evening_close(dest, day=None):
             return
         jal, rel = jalali.jalali_str(m, d), jalali.file_rel(m, d)
         log.info(await vault_pull())
-        since = day.isoformat(); until = (day + dt.timedelta(1)).isoformat()
-        commits = wr.commits(str(ROOT), GIT_AUTHOR, since, until, wr.DEFAULT_COMMIT_RULES)
+        # The SAME per-session/git/GitLab computation the weekly report uses, windowed to one day —
+        # so "today" means real active hours and threads, not only what got committed or merged.
+        wk_sunday = last_sunday(day)
+        ov = wr.load_json(REPORTS / wk_sunday.isoformat() / "overrides.json")
+        jira = wr.load_json(REPORTS / "jira.json")
+        msgs, steps = wr.load_sessions(str(ROOT / "notify-me-workspace" / "logs"))
+        since = day.isoformat()
         mrs_all = wr.fetch_mrs(str(ROOT), since)
-        # GitLab timestamps are UTC; wr.tehran_date() converts before comparing — a raw [:10] slice
-        # reads the UTC calendar day, which can be up to 3.5h off from his Tehran "today".
+        ctx = dict(msgs=msgs, steps=steps, root=str(ROOT), author=GIT_AUTHOR, cap=20, mrs=mrs_all)
+        daily = wr.compute_week(day, 1, ctx, ov, jira, with_mrs=True)
+        commits = daily["commits"]
+        # daily["mrs"] is already the classified {ref,title,state,...} shape from wr.merge_requests();
+        # build_evening_prompt's mr_ref() wants the raw GitLab dicts (it falls back to m['iid']), so
+        # filter mrs_all directly rather than reuse daily["mrs"].
         merged = [x for x in mrs_all if wr.tehran_date(x.get("merged_at") or "") == since]
         touched = [x for x in mrs_all if x.get("state") == "opened" and wr.tehran_date(x.get("updated_at") or "") == since]
         before = await asyncio.to_thread(vault_head)
-        prompt = build_evening_prompt(day, jal, rel, commits, merged, touched)
+        prompt = build_evening_prompt(day, jal, rel, commits, merged, touched, session_lines_for(daily))
         async with dest.typing():
             result, err = await claude_run(prompt, VAULT_WRITE_TOOLS, QA_TIMEOUT, BOT_DIR, extra=["--append-system-prompt", EVENING_SYSTEM_PROMPT])
         after = await asyncio.to_thread(vault_head)
     if err:
         await dest.send(f"Evening close failed: {err}")
         return
-    title = f"Evening close — {jal} ({day.strftime('%a %d %b')})"
+    title = f"Evening Close — {jal} ({day.strftime('%a %d %b')})"
     pushed = await asyncio.to_thread(vault_pushed)
+    stat = await asyncio.to_thread(vault_diff_stat, before, after) if after != before else ""
+    added = await asyncio.to_thread(vault_diff_added_lines, before, after, rel) if after != before else []
+
+    # Worklog section of the report, built from the SAME git-diff ground truth as the Discord
+    # embed below — never from the model's own "I ticked X" narrative.
     if after == before:
-        note = "No changes." if pushed is not False else "No changes this run — but an earlier commit is still unpushed (see below)."
-        await dest.send(f"**{title}**\n{note}\n{(result or '').strip()[:500]}")
-        if pushed is False:
-            await dest.send(f"⚠️ Local HEAD is ahead of `origin` — the vault deploy key is likely still read-only. Local commit `{after[:8]}` has not reached GitHub.")
-        return
-    stat = await asyncio.to_thread(vault_diff_stat, before, after)
-    added = await asyncio.to_thread(vault_diff_added_lines, before, after, rel)
-    e = discord.Embed(title=title)
-    e.add_field(name="File", value=f"`{rel}`", inline=False)
-    if stat:
-        e.add_field(name="Diff", value=f"```\n{stat[:900]}\n```", inline=False)
-    if added:
-        e.add_field(name="Ticked / added", value=f"```diff\n{chr(10).join(added[:25])[:900]}\n```", inline=False)
+        worklog_html = f'<p>No changes to the worklog today.</p><p class="lead">{wr.esc((result or "").strip()[:400])}</p>'
+    else:
+        items = "".join(f"<li>{wr.esc(l)}</li>" for l in added[:25])
+        worklog_html = f'<ul>{items}</ul><div class="src">{wr.esc(rel)}</div>'
+    if pushed is False:
+        worklog_html += '<div class="cal warn"><div><p><strong>Not pushed.</strong> Committed locally, but the push did not reach GitHub — the vault deploy key is likely still read-only.</p></div></div>'
+
+    content = wr.render_daily(daily, jal, day, worklog_html)
+    out_dir = REPORTS / wk_sunday.isoformat(); out_dir.mkdir(parents=True, exist_ok=True)
+    content_p = out_dir / f"daily-{jal}.content.html"; report_p = out_dir / f"daily-{jal}.html"
+    content_p.write_text(content, encoding="utf-8")
+    try:
+        kit = wr.find_kit()
+        subprocess.run([sys.executable, kit, str(content_p), "-o", str(report_p), "--lang", "en", "--title", title], check=True, capture_output=True, text=True)
+        report_file = discord.File(str(report_p), filename=f"evening-close-{jal}.html")
+    except subprocess.CalledProcessError as ex:
+        log.info("evening-close kit build failed: %s", ex.stderr[-500:] if ex.stderr else ex)
+        report_file = None
+
+    tot = sum(daily["wall"].values())
+    e = discord.Embed(title=title, description=f"{tot/60:.1f} active hours · {daily['kpis']['sessions']} sessions · {daily['kpis']['commits']} commits · {len(merged)} MRs merged")
+    if tot > 1e-6:
+        for c in wr.CATS:
+            if daily["wall"].get(c):
+                e.add_field(name=wr.LABEL[c], value=wr.h(daily["wall"][c] / 60), inline=True)
     if pushed is False:
         e.color = discord.Color.orange()
-        e.add_field(name="⚠️ Not pushed", value="Committed locally, but the push did not reach GitHub — the deploy key is likely still read-only.", inline=False)
-    await dest.send(embed=e)
+        e.add_field(name="⚠️ Not pushed", value="Committed locally; deploy key is likely still read-only.", inline=False)
+    await dest.send(embed=e, file=report_file) if report_file else await dest.send(embed=e)
     s = load_state(); s["last_evening_close"] = day.isoformat(); save_state(s)
 
 
