@@ -7,7 +7,7 @@ the /weekly-report skill (steps 0-5) and posted here as an embed + the report.ht
 
 Config: ~/.config/weekly-bot/.env (see README). State: ~/weekly-bot/state.json.
 """
-import asyncio, datetime as dt, json, logging, os, pathlib, shlex, subprocess, sys
+import asyncio, collections, datetime as dt, json, logging, os, pathlib, shlex, subprocess, sys
 from zoneinfo import ZoneInfo
 
 import discord
@@ -270,6 +270,27 @@ EVENING_SYSTEM_PROMPT = ("You are running unattended from a Discord bot's evenin
                         "file and vault git plumbing — never any other file, never any other repo.")
 
 
+def bar_ascii(pct, width=14):
+    filled = max(0, min(width, round(width * pct / 100)))
+    return "█" * filled + "░" * (width - filled)
+
+
+def category_block(wall, tot):
+    if tot <= 1e-6:
+        return None
+    lines = []
+    for c in wr.CATS:
+        v = wall.get(c, 0)
+        if not v:
+            continue
+        pct = v / tot * 100
+        lines.append(f"{wr.SHORT[c]:<3}{bar_ascii(pct)} {pct:>3.0f}%  {wr.h(v / 60)}")
+    return "\n".join(lines)
+
+
+CAT_EMOJI = {"maintenance": "🐞", "reliability": "🛠️", "feature": "✨", "workspace": "🧰"}
+
+
 def session_lines_for(daily, cap=10):
     rows = [r for r in daily["ledger"] if r["hours"] > 0.03 or r["msgs"] >= 3]
     rows.sort(key=lambda r: -r["hours"])
@@ -317,43 +338,69 @@ async def run_evening_close(dest, day=None):
     if err:
         await dest.send(f"Evening close failed: {err}")
         return
-    title = f"Evening Close — {jal} ({day.strftime('%a %d %b')})"
     pushed = await asyncio.to_thread(vault_pushed)
-    stat = await asyncio.to_thread(vault_diff_stat, before, after) if after != before else ""
-    added = await asyncio.to_thread(vault_diff_added_lines, before, after, rel) if after != before else []
-
-    # Worklog section of the report, built from the SAME git-diff ground truth as the Discord
-    # embed below — never from the model's own "I ticked X" narrative.
-    if after == before:
-        worklog_html = f'<p>No changes to the worklog today.</p><p class="lead">{wr.esc((result or "").strip()[:400])}</p>'
-    else:
-        items = "".join(f"<li>{wr.esc(l)}</li>" for l in added[:25])
-        worklog_html = f'<ul>{items}</ul><div class="src">{wr.esc(rel)}</div>'
-    if pushed is False:
-        worklog_html += '<div class="cal warn"><div><p><strong>Not pushed.</strong> Committed locally, but the push did not reach GitHub — the vault deploy key is likely still read-only.</p></div></div>'
-
-    content = wr.render_daily(daily, jal, day, worklog_html)
-    out_dir = REPORTS / wk_sunday.isoformat(); out_dir.mkdir(parents=True, exist_ok=True)
-    content_p = out_dir / f"daily-{jal}.content.html"; report_p = out_dir / f"daily-{jal}.html"
-    content_p.write_text(content, encoding="utf-8")
-    try:
-        kit = wr.find_kit()
-        subprocess.run([sys.executable, kit, str(content_p), "-o", str(report_p), "--lang", "en", "--title", title], check=True, capture_output=True, text=True)
-        report_file = discord.File(str(report_p), filename=f"evening-close-{jal}.html")
-    except subprocess.CalledProcessError as ex:
-        log.info("evening-close kit build failed: %s", ex.stderr[-500:] if ex.stderr else ex)
-        report_file = None
-
+    changed = after != before
+    added = await asyncio.to_thread(vault_diff_added_lines, before, after, rel) if changed else []
     tot = sum(daily["wall"].values())
-    e = discord.Embed(title=title, description=f"{tot/60:.1f} active hours · {daily['kpis']['sessions']} sessions · {daily['kpis']['commits']} commits · {len(merged)} MRs merged")
-    if tot > 1e-6:
-        for c in wr.CATS:
-            if daily["wall"].get(c):
-                e.add_field(name=wr.LABEL[c], value=wr.h(daily["wall"][c] / 60), inline=True)
+
     if pushed is False:
-        e.color = discord.Color.orange()
-        e.add_field(name="⚠️ Not pushed", value="Committed locally; deploy key is likely still read-only.", inline=False)
-    await dest.send(embed=e, file=report_file) if report_file else await dest.send(embed=e)
+        color = discord.Color.orange()
+    elif changed:
+        color = discord.Color.green()
+    elif tot > 1e-6:
+        color = discord.Color.blurple()
+    else:
+        color = discord.Color.light_grey()
+
+    desc = [f"**{day.strftime('%A, %d %B')}**"]
+    if tot > 1e-6:
+        desc.append(f"{tot/60:.1f}h active · {daily['kpis']['sessions']} sessions · {daily['kpis']['commits']} commits · {len(merged)} merged / {len(touched)} open")
+        cat = category_block(daily["wall"], tot)
+        if cat:
+            desc.append(f"```\n{cat}\n```")
+    else:
+        desc.append(f"No session activity logged · {daily['kpis']['commits']} commits · {len(merged)} merged / {len(touched)} open")
+    e = discord.Embed(title=f"🌙 Evening Close — {jal}", description="\n".join(desc), color=color)
+
+    if daily["ledger"]:
+        rows = sorted(daily["ledger"], key=lambda r: -r["hours"])[:6]
+        lines = [f"{CAT_EMOJI.get(r['cat'], '•')} {(r['ref'] if r['ref'].startswith('RS-') else r['what'][:55])}" + (f" — {wr.h(r['hours'])}" if r["hours"] > 0.01 else "") for r in rows]
+        extra = len(daily["ledger"]) - len(rows)
+        if extra > 0:
+            lines.append(f"_+{extra} more_")
+        e.add_field(name="🧵 Threads today", value="\n".join(lines)[:1024], inline=False)
+
+    if daily["commits"]:
+        by_repo = collections.Counter(c["repo"] for c in daily["commits"])
+        val = "\n".join(f"`{repo}` × {n}" for repo, n in by_repo.most_common(6))
+        e.add_field(name=f"📦 Commits ({len(daily['commits'])})", value=val[:1024], inline=True)
+
+    if merged or touched:
+        lines = [f"✅ {mr_ref(m)} {m['title'][:45]}" for m in merged[:4]] + [f"🟡 {mr_ref(m)} {m['title'][:45]}" for m in touched[:4]]
+        e.add_field(name="🔀 Merge requests", value="\n".join(lines)[:1024], inline=True)
+
+    # Worklog field is built from the git-diff ground truth (`added`), never from the model's own
+    # "I ticked X" narrative — same discipline as the diff-stat embed this replaces.
+    if not changed:
+        wl = "No changes." if pushed is not False else "No changes this run — an earlier commit is still unpushed."
+    else:
+        checklist = []
+        for l in added[:12]:
+            ls = l.strip()
+            if ls.startswith("- [x]"):
+                checklist.append("✅ " + ls[5:].strip())
+            elif ls.startswith("- [ ]"):
+                checklist.append("🆕 " + ls[5:].strip())
+            else:
+                checklist.append(ls)
+        wl = "\n".join(checklist)[:1024] or "_(see vault)_"
+    e.add_field(name="📓 Worklog", value=wl, inline=False)
+
+    if pushed is False:
+        e.add_field(name="⚠️ Not pushed", value="Committed locally, but the push didn't reach GitHub — the vault deploy key is likely still read-only.", inline=False)
+
+    e.set_footer(text=f"{rel} · supervised agent time")
+    await dest.send(embed=e)
     s = load_state(); s["last_evening_close"] = day.isoformat(); save_state(s)
 
 
