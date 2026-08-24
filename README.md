@@ -1,6 +1,8 @@
-# weekly-bot — personal Discord bot for the weekly review, evening close, brag doc & Q&A
+# Khoshzad — personal Discord bot for the weekly review, evening close, brag doc & Q&A
 
-Runs on the dev box as `systemd --user` service `weekly-bot`. Owner-only. Answers and
+Khoshzad (خوش‌زاد) is Sajjad's personal Discord bot. Runs on the dev box as
+`systemd --user` service `weekly-bot` — the service, directory and repo keep the plain
+functional name; the bot's persona in conversation is Khoshzad. Owner-only. Answers and
 write-mode jobs come from headless `claude -p` on your own subscription. Schedule:
 **evening close** Sun–Thu 17:30, **weekly report + brag document + snippet** Thu 19:00
 — all Asia/Tehran.
