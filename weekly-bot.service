@@ -1,0 +1,16 @@
+[Unit]
+Description=Personal weekly-report Discord bot (owner-only, claude -p backed)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/weekly-bot
+EnvironmentFile=%h/.config/weekly-bot/.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.local/bin
+ExecStart=%h/weekly-bot/.venv/bin/python %h/weekly-bot/bot.py
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target
