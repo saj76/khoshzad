@@ -38,7 +38,7 @@ journalctl --user -u weekly-bot -f    # expect: "ready as <bot> · owner … · 
 | Command | Does |
 |---|---|
 | `/weekly [sunday]` | Full report for that week (default: current). Posts the embed + `report.html`, then auto-chains `/brag` and `/snippet` for the same week. |
-| `/brief [date]` | Morning brief for that date (default: today). Today's open worklog items, anything unchecked carried from the last work day, your full open-reviewer-MR queue (flagged past 24h), and a live Jira lookup for open issues assigned to you. Read-only — nothing written to the vault. |
+| `/brief [date]` | Morning brief for that date (default: today). On the live default run, if today's worklog page doesn't exist yet it's created in your own `Main tasks:` format — seeded with yesterday's unfinished main tasks, exactly what you'd retype by hand — and pushed. Then shows the plan, your full open-reviewer-MR queue (flagged past 24h), and a live Jira lookup for open issues assigned to you. A manual `/brief <past-date>` never creates a file — read-only in that case. |
 | `/close [date]` | Evening close for that date (default: today). Reconciles the day's worklog against real commits/MRs, ticks what's supported, appends unplanned work, pushes to the vault, posts a diff embed. |
 | `/brag [sunday]` | Append evidence-backed wins to `Brag/1405.md` in the vault, under Julia Evans' sections. Requires that week's report to exist. |
 | `/snippet [sunday]` | Post a short Persian شد/آموختم/بعدی/گیر کردم update — Discord only, nothing written to the vault. |
@@ -58,12 +58,16 @@ the self-report" discipline the workspace uses for dev-agent review.
 
 ## How it works
 
-- **Morning brief** (`run_morning_brief`): read-only. Today's worklog checklist (if written yet)
-  and yesterday's unchecked items straight from the vault file — no model involved, since checking
-  `- [ ]` vs `- [x]` is mechanical. Your full open-reviewer MR queue comes from GitLab
-  (`open_reviewer_mrs`, age = time since the MR was opened, flagged 🔴 past 24h). The one thing
-  that needs `claude -p` is the live Jira lookup (`assignee = currentUser() AND statusCategory !=
-  Done`) via the Atlassian MCP — a narrow, read-only tool call, not a judgment call.
+- **Morning brief** (`run_morning_brief`): on the live scheduled/default run (never for a manual
+  `/brief <past-date>` lookup), if today's worklog page doesn't exist yet, it's created —
+  `seed_todays_worklog` writes his own `Main tasks:` header plus one `- [ ]` per unfinished main
+  task carried from the last work day (`unfinished_main_tasks`, which excludes evening close's own
+  `(session)`/`(unplanned)` log entries — confirmed from his real history that only the untagged
+  bullets get retyped by hand each morning), then commits and pushes — mechanical, no model
+  involved. Never overwrites a file he already wrote. Your full open-reviewer MR queue comes from
+  GitLab (`open_reviewer_mrs`, age = time since the MR was opened, flagged 🔴 past 24h). The one
+  thing that needs `claude -p` is the live Jira lookup (`assignee = currentUser() AND
+  statusCategory != Done`) via the Atlassian MCP — a narrow, read-only tool call, not a judgment call.
 - **Evening close** (`run_evening_close`): resolves today's Jalali date (`jalali.py`,
   1405 anchor table), pre-fetches today's commits and MRs itself (reusing
   `weekly_report.py`'s `commits()`/`fetch_mrs()` — one source of truth), and hands

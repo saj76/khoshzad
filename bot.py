@@ -451,6 +451,33 @@ def worklog_checklist(rel):
     return items
 
 
+def unfinished_main_tasks(items):
+    """Unchecked lines that are recurring plan items — excludes the evening close's own
+    '(session)'/'(unplanned)' activity-log entries. Confirmed from his own worklog history: only
+    the untagged 'Main tasks' bullets get retyped at the top of the next day's file by hand; a
+    day's session/unplanned log never carries forward."""
+    return [t for c, t in items if not c and not re.match(r"\(session\)|\(unplanned\)", t, re.I)]
+
+
+def seed_todays_worklog(rel, carried):
+    """Create today's worklog file in his own 'Main tasks:' format, seeded with yesterday's
+    unfinished main tasks — mirrors what he does by hand every morning. Never overwrites an
+    existing file (if he already wrote today's plan, that's authoritative)."""
+    p = VAULT / rel
+    if p.is_file():
+        return False
+    p.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["Main tasks:"] + [f"- [ ] {t}" for t in carried]
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return True
+
+
+def push_worklog(rel, jal):
+    subprocess.run(["git", "-C", str(VAULT), "add", "--", rel], capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(VAULT), "commit", "-m", f"morning brief: seed {jal} worklog"], capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(VAULT), "push"], capture_output=True, text=True)
+
+
 def meetings_today(month_folder, jal):
     """Meeting note titles for today, from the vault — a cross-check/fallback alongside the real
     Google Calendar durations in the MEETINGS section of the model's reply (build_evening_prompt
@@ -735,6 +762,7 @@ async def run_morning_brief(dest, day=None):
         await dest.send("Busy with another run — try again in a moment.")
         return
     async with run_lock:
+        is_live = day is None
         day = day or dt.datetime.now(TZ).date()
         try:
             y, m, d = jalali.greg_to_jalali(day)
@@ -744,9 +772,20 @@ async def run_morning_brief(dest, day=None):
         jal, rel = jalali.jalali_str(m, d), jalali.file_rel(m, d)
         log.info(await vault_pull())
 
-        today_items = worklog_checklist(rel)
         py, pm, pd = jalali.greg_to_jalali(prev_workday(day))
-        carried = [t for c, t in (worklog_checklist(jalali.file_rel(pm, pd)) or []) if not c]
+        carried = unfinished_main_tasks(worklog_checklist(jalali.file_rel(pm, pd)) or [])
+
+        # Only auto-create today's page on the real scheduled/default run, on a real work day —
+        # never for a manual /brief <past-date> lookup, which would otherwise write a phantom
+        # worklog into vault history for a day that never had one.
+        seeded, pushed = False, None
+        if is_live and day.weekday() in EVENING_DOWS:
+            seeded = await asyncio.to_thread(seed_todays_worklog, rel, carried)
+            if seeded:
+                await asyncio.to_thread(push_worklog, rel, jal)
+                pushed = await asyncio.to_thread(vault_pushed)
+
+        today_items = worklog_checklist(rel)
 
         reviewing = await asyncio.to_thread(open_reviewer_mrs, str(ROOT))
         reviewing.sort(key=mr_age_hours, reverse=True)
@@ -758,15 +797,20 @@ async def run_morning_brief(dest, day=None):
 
     e = discord.Embed(title=f"☀️ Morning Brief — {jal}", description=f"**{day.strftime('%A, %d %B')}**", color=discord.Color.gold())
 
-    if today_items is None:
-        plan_val = "_(not written yet)_"
+    if seeded:
+        body = "\n".join(f"• {t}" for t in carried) if carried else "_(nothing carried — clean slate)_"
+        e.add_field(name="🗒️ Today's plan (seeded from yesterday)", value=body[:1024], inline=False)
+        if pushed is False:
+            e.add_field(name="⚠️ Not pushed", value="Seeded locally, but the push didn't reach GitHub.", inline=False)
     else:
-        unchecked = [t for c, t in today_items if not c]
-        plan_val = "\n".join(f"• {t}" for t in unchecked[:10]) if unchecked else "_(nothing open)_"
-    e.add_field(name="🗒️ Today's plan", value=plan_val[:1024], inline=False)
-
-    if carried:
-        e.add_field(name="⏮️ Carried from yesterday", value="\n".join(f"• {t}" for t in carried)[:1024], inline=False)
+        if today_items is None:
+            plan_val = "_(not written yet)_"
+        else:
+            unchecked = [t for c, t in today_items if not c]
+            plan_val = "\n".join(f"• {t}" for t in unchecked[:10]) if unchecked else "_(nothing open)_"
+        e.add_field(name="🗒️ Today's plan", value=plan_val[:1024], inline=False)
+        if carried:
+            e.add_field(name="⏮️ Carried from yesterday", value="\n".join(f"• {t}" for t in carried)[:1024], inline=False)
 
     if reviewing:
         lines = []
