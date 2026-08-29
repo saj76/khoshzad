@@ -7,7 +7,7 @@ the /weekly-report skill (steps 0-5) and posted here as an embed + the report.ht
 
 Config: ~/.config/weekly-bot/.env (see README). State: ~/weekly-bot/state.json.
 """
-import asyncio, collections, datetime as dt, json, logging, os, pathlib, shlex, subprocess, sys
+import asyncio, collections, datetime as dt, json, logging, os, pathlib, re, shlex, subprocess, sys
 from zoneinfo import ZoneInfo
 
 import discord
@@ -35,6 +35,7 @@ SCRIPT = pathlib.Path(os.environ.get("SKILL_SCRIPT") or HOME / ".claude/skills/w
 CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
 ROOT = pathlib.Path(os.environ.get("ROOT_DIR") or HOME / "Notify-Me")
 GIT_AUTHOR = os.environ.get("GIT_AUTHOR", "Sajjad Vahedi")
+GITLAB_USER = os.environ.get("GITLAB_USER", "sajjad.vahedi")
 
 sys.path.insert(0, str(SCRIPT.parent))
 import weekly_report as wr  # reused for commits()/fetch_mrs() — one source of truth with /weekly-report
@@ -300,6 +301,50 @@ def session_excerpt(msgs, sid, today_iso, max_msgs=14, max_chars=900):
     return "\n".join(lines)
 
 
+REVIEW_PATTERN = re.compile(r"/code-review\b|/peer-review\b|/coderabbit-review\b|review this|please review|code review|reviewed by|\bLGTM\b|approve this|review round|review comments", re.I)
+
+
+def review_hours_today(daily, msgs, today_iso):
+    """Cross-cutting, not a fifth category: a review session still keeps its BF/AP/FD/WD tag —
+    this is 'of those hours, how many went to reviewing someone else's work', approximated at the
+    whole-session grain (a session is or isn't a review session; not split mid-session)."""
+    total = 0.0
+    for r in daily["ledger"]:
+        text = " ".join(m["text"] for sid in r["sids"] for m in msgs if m["sid"] == sid and m["d"] == today_iso)
+        if REVIEW_PATTERN.search(text):
+            total += r["hours"]
+    return total
+
+
+def fetch_reviewer_mrs(root, since_date):
+    """MRs where he's a reviewer (not author) touched today — GitLab ground truth, independent of
+    what any session transcript says. Mirrors wr.fetch_mrs()'s shape but a different API scope
+    (reviewer_username, not scope=created_by_me), so it stays local to the daily close rather than
+    widen the shared weekly_report.py module for a feature only this command uses."""
+    since_utc = dt.datetime.fromisoformat(f"{since_date}T00:00:00+03:30").astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for r in wr.repos_under(root):
+        try:
+            out = subprocess.run(["glab", "api", f"merge_requests?reviewer_username={GITLAB_USER}&scope=all&updated_after={since_utc}&per_page=100"],
+                                 cwd=r, capture_output=True, text=True, timeout=60).stdout
+            data = json.loads(out)
+            if isinstance(data, list):
+                return data
+        except Exception:
+            continue
+    return []
+
+
+def meetings_today(month_folder, jal):
+    """Meeting note titles for today, from the vault — not a duration. No meeting note in the
+    vault records start/end time, so this is visibility only; a real per-meeting duration would
+    need the Google Calendar connector (claude.ai connector settings — his authorization, not
+    something this box can do unattended)."""
+    mdir = VAULT / month_folder / "Meetings"
+    if not mdir.is_dir():
+        return []
+    return sorted((p.stem[len(jal):].strip(" -") or p.stem) for p in mdir.rglob(f"{jal}*.md"))
+
+
 def transcripts_for(daily, msgs, today_iso, cap=8):
     rows = sorted((r for r in daily["ledger"] if r["hours"] > 0.03 or r["msgs"] >= 3), key=lambda r: -r["hours"])[:cap]
     blocks = []
@@ -357,6 +402,10 @@ async def run_evening_close(dest, day=None):
         # filter mrs_all directly rather than reuse daily["mrs"].
         merged = [x for x in mrs_all if wr.tehran_date(x.get("merged_at") or "") == since]
         touched = [x for x in mrs_all if x.get("state") == "opened" and wr.tehran_date(x.get("updated_at") or "") == since]
+        review_hours = review_hours_today(daily, msgs, since)
+        reviewing = [x for x in await asyncio.to_thread(fetch_reviewer_mrs, str(ROOT), since)
+                    if wr.tehran_date(x.get("updated_at") or "") == since and (x.get("author") or {}).get("username") != GITLAB_USER]
+        meetings = meetings_today(jalali.folder_name(m), jal)
         before = await asyncio.to_thread(vault_head)
         prompt = build_evening_prompt(day, jal, rel, commits, merged, touched, transcripts_for(daily, msgs, since))
         async with dest.typing():
@@ -381,13 +430,23 @@ async def run_evening_close(dest, day=None):
 
     desc = [f"**{day.strftime('%A, %d %B')}**"]
     if tot > 1e-6:
-        desc.append(f"{tot/60:.1f}h active · {daily['kpis']['sessions']} sessions · {daily['kpis']['commits']} commits · {len(merged)} merged / {len(touched)} open")
+        line = f"{tot/60:.1f}h active · {daily['kpis']['sessions']} sessions · {daily['kpis']['commits']} commits · {len(merged)} merged / {len(touched)} open"
+        if review_hours > 0.01:
+            # review_hours is raw per-session engagement time (can overlap across concurrent
+            # sessions, same "engagement vs. wall-clock" distinction the weekly report discloses
+            # in its Method section) — clamped to the wall-clock ceiling so it can never read as
+            # bigger than "active hours" on the same line, and marked ~ since it's an approximation.
+            line += f" · 🔎 ~{wr.h(min(review_hours, tot / 60))} reviewing"
+        desc.append(line)
         cat = category_block(daily["wall"], tot)
         if cat:
             desc.append(f"```\n{cat}\n```")
     else:
         desc.append(f"No session activity logged · {daily['kpis']['commits']} commits · {len(merged)} merged / {len(touched)} open")
     e = discord.Embed(title=f"🌙 Evening Close — {jal}", description="\n".join(desc), color=color)
+
+    if meetings:
+        e.add_field(name="🤝 Meetings today", value="\n".join(f"• {t}" for t in meetings)[:1024], inline=False)
 
     # Primary content: the model's plan-vs-actual read of today's real conversations, not a
     # mechanical ledger dump. Trusted verbatim — its own instructions constrain the format tightly.
@@ -402,6 +461,10 @@ async def run_evening_close(dest, day=None):
     if merged or touched:
         lines = [f"✅ {mr_ref(m)} {m['title'][:45]}" for m in merged[:4]] + [f"🟡 {mr_ref(m)} {m['title'][:45]}" for m in touched[:4]]
         e.add_field(name="🔀 Merge requests", value="\n".join(lines)[:1024], inline=True)
+
+    if reviewing:
+        lines = [f"👀 {mr_ref(m)} {m['title'][:45]}" for m in reviewing[:6]]
+        e.add_field(name=f"🔎 Reviewing ({len(reviewing)})", value="\n".join(lines)[:1024], inline=True)
 
     # Secondary field: what actually got WRITTEN to the vault file, from the git-diff ground truth
     # (`added`) — never from the model's own "I ticked X" narrative. The Task Map above is the
