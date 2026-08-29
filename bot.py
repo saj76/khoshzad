@@ -47,6 +47,8 @@ POST_HOUR = int(os.environ.get("POST_HOUR", "19"))
 EVENING_HOUR = int(os.environ.get("EVENING_HOUR", "17"))
 EVENING_MINUTE = int(os.environ.get("EVENING_MINUTE", "30"))
 EVENING_DOWS = {6, 0, 1, 2, 3}  # Sun–Thu (Python weekday: Mon=0 … Sun=6)
+MORNING_HOUR = int(os.environ.get("MORNING_HOUR", "8"))
+MORNING_MINUTE = int(os.environ.get("MORNING_MINUTE", "0"))
 QA_TIMEOUT = int(os.environ.get("QA_TIMEOUT", "240"))
 WEEKLY_TIMEOUT = int(os.environ.get("WEEKLY_TIMEOUT", "2400"))
 QA_TOOLS = ["Read", "Glob", "Grep", "Bash(git -C * log*)", "Bash(ls *)"]
@@ -405,6 +407,50 @@ def vault_reviews_today(today_iso):
     return sorted({p.strip() for p in out.splitlines() if p.strip()})
 
 
+def open_reviewer_mrs(root):
+    """Full open reviewer inbox — MRs where he's reviewer, not author, still open. Unlike
+    fetch_reviewer_mrs (bounded to 'touched today', for the evening close), this has no date
+    window: it's the whole backlog waiting on him, for the morning brief / review radar."""
+    for r in wr.repos_under(root):
+        try:
+            out = subprocess.run(["glab", "api", f"merge_requests?reviewer_username={GITLAB_USER}&scope=all&state=opened&per_page=100"],
+                                 cwd=r, capture_output=True, text=True, timeout=60).stdout
+            data = json.loads(out)
+            if isinstance(data, list):
+                return [m for m in data if (m.get("author") or {}).get("username") != GITLAB_USER]
+        except Exception:
+            continue
+    return []
+
+
+def mr_age_hours(m):
+    created = dt.datetime.fromisoformat(m["created_at"].replace("Z", "+00:00"))
+    return (dt.datetime.now(dt.timezone.utc) - created).total_seconds() / 3600
+
+
+def prev_workday(d):
+    """Previous Sun-Thu work day, skipping the Fri/Sat weekend — 'yesterday' for a Sunday brief
+    is Thursday, not Saturday."""
+    p = d - dt.timedelta(days=1)
+    while p.weekday() not in EVENING_DOWS:
+        p -= dt.timedelta(days=1)
+    return p
+
+
+def worklog_checklist(rel):
+    """(checked, text) for every '- [ ]'/'- [x]' line in a vault worklog file, or None if the
+    file doesn't exist yet (a real, common state at 08:00 — he often writes the plan later)."""
+    p = VAULT / rel
+    if not p.is_file():
+        return None
+    items = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        m = re.match(r"-\s\[([ xX])\]\s+(.*)", line.strip())
+        if m:
+            items.append((m.group(1).lower() == "x", m.group(2).strip()))
+    return items
+
+
 def meetings_today(month_folder, jal):
     """Meeting note titles for today, from the vault — a cross-check/fallback alongside the real
     Google Calendar durations in the MEETINGS section of the model's reply (build_evening_prompt
@@ -662,6 +708,79 @@ async def run_snippet(dest, week):
     await send_long(dest, f"**اسنیپت هفتگی — {week}**\n\n{result}")
 
 
+# ---------------------------------------------------------------- morning brief
+ATLASSIAN_TOOLS = ["mcp__atlassian__getAccessibleAtlassianResources", "mcp__atlassian__searchJiraIssuesUsingJql"]
+
+MORNING_SYSTEM_PROMPT = (
+    "You are running unattended from a Discord bot's morning-brief job. Read-only: do not create, "
+    "edit, comment on, or transition any Jira issue. Reply with EXACTLY one short bullet list, no "
+    "preamble, no markdown headers — one line per issue as `KEY status — summary`, prefixed with ⏳ "
+    "if the status mentions customer/waiting/pending. If there are none, reply exactly: "
+    "No open Jira issues assigned to you."
+)
+
+
+def build_morning_prompt(jal, day):
+    return (
+        f"Morning brief for {jal} ({day.strftime('%A, %d %B')}). Find my current open Jira work:\n"
+        "1. Call mcp__atlassian__getAccessibleAtlassianResources to get the cloudId for partnerz.atlassian.net.\n"
+        "2. Call mcp__atlassian__searchJiraIssuesUsingJql with that cloudId and JQL: "
+        "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC\n"
+        "3. Report every issue found per the reply format in your system prompt."
+    )
+
+
+async def run_morning_brief(dest, day=None):
+    if run_lock.locked():
+        await dest.send("Busy with another run — try again in a moment.")
+        return
+    async with run_lock:
+        day = day or dt.datetime.now(TZ).date()
+        try:
+            y, m, d = jalali.greg_to_jalali(day)
+        except ValueError as e:
+            await dest.send(f"Can't place that date on the 1405 calendar: {e}")
+            return
+        jal, rel = jalali.jalali_str(m, d), jalali.file_rel(m, d)
+        log.info(await vault_pull())
+
+        today_items = worklog_checklist(rel)
+        py, pm, pd = jalali.greg_to_jalali(prev_workday(day))
+        carried = [t for c, t in (worklog_checklist(jalali.file_rel(pm, pd)) or []) if not c]
+
+        reviewing = await asyncio.to_thread(open_reviewer_mrs, str(ROOT))
+        reviewing.sort(key=mr_age_hours, reverse=True)
+
+        prompt = build_morning_prompt(jal, day)
+        async with dest.typing():
+            jira_text, err = await claude_run(prompt, ATLASSIAN_TOOLS, QA_TIMEOUT, BOT_DIR,
+                                               extra=["--append-system-prompt", MORNING_SYSTEM_PROMPT])
+
+    e = discord.Embed(title=f"☀️ Morning Brief — {jal}", description=f"**{day.strftime('%A, %d %B')}**", color=discord.Color.gold())
+
+    if today_items is None:
+        plan_val = "_(not written yet)_"
+    else:
+        unchecked = [t for c, t in today_items if not c]
+        plan_val = "\n".join(f"• {t}" for t in unchecked[:10]) if unchecked else "_(nothing open)_"
+    e.add_field(name="🗒️ Today's plan", value=plan_val[:1024], inline=False)
+
+    if carried:
+        e.add_field(name="⏮️ Carried from yesterday", value="\n".join(f"• {t}" for t in carried)[:1024], inline=False)
+
+    if reviewing:
+        lines = []
+        for mr in reviewing[:8]:
+            age = mr_age_hours(mr)
+            lines.append(f"{'🔴' if age > 24 else '🟡'} {mr_ref(mr)} {mr['title'][:45]} · {age:.0f}h")
+        e.add_field(name=f"🔎 Awaiting your review ({len(reviewing)})", value="\n".join(lines)[:1024], inline=False)
+
+    e.add_field(name="📋 Jira", value=(f"_(lookup failed: {err})_" if err else (jira_text or "").strip()[:1024] or "_(none)_"), inline=False)
+
+    await dest.send(embed=e)
+    s = load_state(); s["last_morning_brief"] = day.isoformat(); save_state(s)
+
+
 # ---------------------------------------------------------------- commands
 @tree.command(name="weekly", description="Generate and post the weekly review (default: current week)")
 @app_commands.describe(week_start="Sunday as YYYY-MM-DD (optional)")
@@ -700,8 +819,10 @@ async def status_cmd(inter: discord.Interaction):
     s = load_state(); note = await vault_pull()
     weeks = sorted(p.name for p in REPORTS.iterdir() if p.is_dir() and (p / "metrics.json").is_file()) if REPORTS.is_dir() else []
     await inter.response.send_message(f"{note}\nreports: {', '.join(weeks[-4:]) or 'none'}\n"
+                                      f"last morning brief: {s.get('last_morning_brief', 'never')}\n"
                                       f"last evening close: {s.get('last_evening_close', 'never')}\nlast weekly post: {s.get('last_posted_week', 'never')}\n"
-                                      f"schedule: evening close Sun–Thu {EVENING_HOUR:02d}:{EVENING_MINUTE:02d} · weekly {['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][POST_DOW]} {POST_HOUR:02d}:00 · {TZ.key}\n"
+                                      f"schedule: morning brief Sun–Thu {MORNING_HOUR:02d}:{MORNING_MINUTE:02d} · evening close Sun–Thu {EVENING_HOUR:02d}:{EVENING_MINUTE:02d} · "
+                                      f"weekly {['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][POST_DOW]} {POST_HOUR:02d}:00 · {TZ.key}\n"
                                       f"busy: {run_lock.locked()}", ephemeral=True)
 
 
@@ -716,6 +837,19 @@ async def close_cmd(inter: discord.Interaction, date: str = ""):
         await inter.response.send_message("Use YYYY-MM-DD.", ephemeral=True); return
     await inter.response.send_message("On it.", ephemeral=True)
     await run_evening_close(inter.channel, day)
+
+
+@tree.command(name="brief", description="Manually run the morning brief (default: today)")
+@app_commands.describe(date="YYYY-MM-DD, optional")
+async def brief_cmd(inter: discord.Interaction, date: str = ""):
+    if not is_owner(inter.user):
+        await inter.response.send_message("Owner only.", ephemeral=True); return
+    try:
+        day = dt.date.fromisoformat(date) if date else None
+    except ValueError:
+        await inter.response.send_message("Use YYYY-MM-DD.", ephemeral=True); return
+    await inter.response.send_message("On it.", ephemeral=True)
+    await run_morning_brief(inter.channel, day)
 
 
 @tree.command(name="brag", description="Update the brag document from a week's report (default: current week)")
@@ -749,22 +883,42 @@ async def on_message(message):
 
 
 # ---------------------------------------------------------------- schedule
+async def run_scheduled(coro, label):
+    """A failure inside a scheduled job must never kill this loop — an uncaught exception here
+    (a GitLab hiccup, a malformed session log) would silently stop every future scheduled run
+    until someone notices the bot's gone quiet and manually restarts the service."""
+    try:
+        await coro
+    except Exception:
+        log.exception("scheduled %s failed", label)
+        try:
+            owner = client.get_user(OWNER_ID) or await client.fetch_user(OWNER_ID)
+            await owner.send(f"⚠️ Scheduled {label} failed — see `journalctl --user -u weekly-bot`. The scheduler is still running.")
+        except Exception:
+            log.exception("could not DM owner about the %s failure", label)
+
+
 async def scheduler():
     await client.wait_until_ready()
     while not client.is_closed():
         now = dt.datetime.now(TZ)
         if CHANNEL_ID and not run_lock.locked():
             s = load_state()
+            if now.weekday() in EVENING_DOWS and now.hour == MORNING_HOUR and now.minute == MORNING_MINUTE \
+               and s.get("last_morning_brief") != now.date().isoformat():
+                ch = client.get_channel(CHANNEL_ID) or await client.fetch_channel(CHANNEL_ID)
+                log.info("scheduled morning brief for %s", now.date())
+                await run_scheduled(run_morning_brief(ch), "morning brief")
             if now.weekday() in EVENING_DOWS and now.hour == EVENING_HOUR and now.minute == EVENING_MINUTE \
                and s.get("last_evening_close") != now.date().isoformat():
                 ch = client.get_channel(CHANNEL_ID) or await client.fetch_channel(CHANNEL_ID)
                 log.info("scheduled evening close for %s", now.date())
-                await run_evening_close(ch)
+                await run_scheduled(run_evening_close(ch), "evening close")
             week = last_sunday(now.date()).isoformat()
             if now.weekday() == POST_DOW and now.hour == POST_HOUR and s.get("last_posted_week") != week:
                 ch = client.get_channel(CHANNEL_ID) or await client.fetch_channel(CHANNEL_ID)
                 log.info("scheduled weekly run for %s", week)
-                await run_weekly(ch, week)
+                await run_scheduled(run_weekly(ch, week), "weekly review")
         await asyncio.sleep(60)
 
 

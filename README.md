@@ -4,8 +4,8 @@ Khoshzad (خوش‌زاد) is Sajjad's personal Discord bot. Runs on the dev box
 `systemd --user` service `weekly-bot` — the service, directory and repo keep the plain
 functional name; the bot's persona in conversation is Khoshzad. Owner-only. Answers and
 write-mode jobs come from headless `claude -p` on your own subscription. Schedule:
-**evening close** Sun–Thu 17:30, **weekly report + brag document + snippet** Thu 19:00
-— all Asia/Tehran.
+**morning brief** Sun–Thu 08:00, **evening close** Sun–Thu 17:30, **weekly report +
+brag document + snippet** Thu 19:00 — all Asia/Tehran.
 
 ## One-time setup (you)
 
@@ -38,6 +38,7 @@ journalctl --user -u weekly-bot -f    # expect: "ready as <bot> · owner … · 
 | Command | Does |
 |---|---|
 | `/weekly [sunday]` | Full report for that week (default: current). Posts the embed + `report.html`, then auto-chains `/brag` and `/snippet` for the same week. |
+| `/brief [date]` | Morning brief for that date (default: today). Today's open worklog items, anything unchecked carried from the last work day, your full open-reviewer-MR queue (flagged past 24h), and a live Jira lookup for open issues assigned to you. Read-only — nothing written to the vault. |
 | `/close [date]` | Evening close for that date (default: today). Reconciles the day's worklog against real commits/MRs, ticks what's supported, appends unplanned work, pushes to the vault, posts a diff embed. |
 | `/brag [sunday]` | Append evidence-backed wins to `Brag/1405.md` in the vault, under Julia Evans' sections. Requires that week's report to exist. |
 | `/snippet [sunday]` | Post a short Persian شد/آموختم/بعدی/گیر کردم update — Discord only, nothing written to the vault. |
@@ -57,6 +58,12 @@ the self-report" discipline the workspace uses for dev-agent review.
 
 ## How it works
 
+- **Morning brief** (`run_morning_brief`): read-only. Today's worklog checklist (if written yet)
+  and yesterday's unchecked items straight from the vault file — no model involved, since checking
+  `- [ ]` vs `- [x]` is mechanical. Your full open-reviewer MR queue comes from GitLab
+  (`open_reviewer_mrs`, age = time since the MR was opened, flagged 🔴 past 24h). The one thing
+  that needs `claude -p` is the live Jira lookup (`assignee = currentUser() AND statusCategory !=
+  Done`) via the Atlassian MCP — a narrow, read-only tool call, not a judgment call.
 - **Evening close** (`run_evening_close`): resolves today's Jalali date (`jalali.py`,
   1405 anchor table), pre-fetches today's commits and MRs itself (reusing
   `weekly_report.py`'s `commits()`/`fetch_mrs()` — one source of truth), and hands
@@ -73,7 +80,8 @@ the self-report" discipline the workspace uses for dev-agent review.
   status for teammates, built from the week's report.
 - **Scheduler**: checked every minute in Asia/Tehran; each job fires once per
   day/week (`state.json`), and the scheduler skips silently (no repeated "busy"
-  messages) if a run is already in progress.
+  messages) if a run is already in progress. A failed scheduled run never kills the
+  loop — it's caught, logged, and DMs you so you know without checking `journalctl`.
 
 ## Notes
 
