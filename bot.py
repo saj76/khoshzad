@@ -56,6 +56,10 @@ WEEKLY_TOOLS = ["Read", "Write", "Edit", "Glob", "Grep", "Bash(python3 *)", "Bas
 VAULT_WRITE_TOOLS = ["Read", "Write", "Edit", "Glob",
                      f"Bash(git -C {VAULT} status*)", f"Bash(git -C {VAULT} add*)", f"Bash(git -C {VAULT} commit*)",
                      f"Bash(git -C {VAULT} push*)", f"Bash(git -C {VAULT} diff*)", f"Bash(git -C {VAULT} log*)"]
+# Calendar is read-only display, not a ground-truth-verified write path like the worklog diff —
+# letting the model call the tool and report durations directly is an acceptable tier here.
+CALENDAR_TOOLS = ["mcp__gcal-mcp__get_events", "mcp__gcal-mcp__list_calendars"]
+GOOGLE_EMAIL = os.environ.get("GOOGLE_CALENDAR_EMAIL", "sajjad.vahedi@partnerz.io")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -272,9 +276,20 @@ def build_evening_prompt(day, jal, rel, commits, merged_mrs, touched_mrs, transc
         "   ➖ <task text, short> — no activity today\n"
         "   If substantial work happened that matches NO planned line, add a final block (blank line before it) "
         "of 🆕 lines, same one-clause style, for that unplanned work only.\n"
-        "8. Reply with ONLY the task map from step 7. No preamble, no push recap, no worklog commentary, "
-        "nothing before or after it. If the worklog has no planned items and no substantial activity happened, "
-        "reply with exactly: No planned items and no substantial activity today."
+        f"8. Separately, call the calendar tool ({', '.join(CALENDAR_TOOLS)}) for calendar_id=primary, "
+        f"user_google_email={GOOGLE_EMAIL}, bounded to {day.isoformat()}T00:00:00+03:30 through "
+        f"{(day + dt.timedelta(1)).isoformat()}T00:00:00+03:30. The tool returns times in whatever timezone each "
+        "event was created with, NOT Tehran — convert every time to Asia/Tehran yourself before reporting. A REAL "
+        "meeting has other attendees or is plainly a call/meeting by its title; SKIP all-day markers, 'Focus time', "
+        "'Out of Office', and any personal self-block with no other attendee. An all-day event's end date is "
+        "exclusive — if today falls only on that exclusive end boundary, it does not belong to today; skip it. For "
+        "each real meeting: `<title> — HH:MM–HH:MM Tehran (~Xm)`. If the tool call fails or returns none, say so "
+        "plainly rather than inventing a meeting.\n"
+        "9. Reply with EXACTLY these two sections, in this order, nothing before the first or after the second:\n"
+        "MEETINGS:\n<one line per real meeting from step 8, or 'No meetings today.' if genuinely none, or the "
+        "literal tool error if the call failed>\n\nTASKMAP:\n<the task map from step 7, or if the worklog has no "
+        "planned items and no substantial activity happened, exactly: No planned items and no substantial "
+        "activity today.>"
     )]
     return "\n".join(lines)
 
@@ -282,7 +297,8 @@ def build_evening_prompt(day, jal, rel, commits, merged_mrs, touched_mrs, transc
 EVENING_SYSTEM_PROMPT = ("You are running unattended from a Discord bot's evening-close job. Never ask questions. "
                         "Only tick a worklog item when a commit or MR clearly supports it. Only touch the one "
                         "worklog file and vault git plumbing — never any other file, never any other repo. Your "
-                        "final reply must be ONLY the task map (step 7/8) — no other text.")
+                        "final reply must be EXACTLY the two sections (MEETINGS: then TASKMAP:) — no other text "
+                        "before, between headers and content, or after.")
 
 
 def session_excerpt(msgs, sid, today_iso, max_msgs=14, max_chars=900):
@@ -405,11 +421,11 @@ async def run_evening_close(dest, day=None):
         review_hours = review_hours_today(daily, msgs, since)
         reviewing = [x for x in await asyncio.to_thread(fetch_reviewer_mrs, str(ROOT), since)
                     if wr.tehran_date(x.get("updated_at") or "") == since and (x.get("author") or {}).get("username") != GITLAB_USER]
-        meetings = meetings_today(jalali.folder_name(m), jal)
+        vault_meetings = meetings_today(jalali.folder_name(m), jal)
         before = await asyncio.to_thread(vault_head)
         prompt = build_evening_prompt(day, jal, rel, commits, merged, touched, transcripts_for(daily, msgs, since))
         async with dest.typing():
-            result, err = await claude_run(prompt, VAULT_WRITE_TOOLS, QA_TIMEOUT, BOT_DIR, extra=["--append-system-prompt", EVENING_SYSTEM_PROMPT])
+            result, err = await claude_run(prompt, VAULT_WRITE_TOOLS + CALENDAR_TOOLS, QA_TIMEOUT, BOT_DIR, extra=["--append-system-prompt", EVENING_SYSTEM_PROMPT])
         after = await asyncio.to_thread(vault_head)
     if err:
         await dest.send(f"Evening close failed: {err}")
@@ -445,12 +461,25 @@ async def run_evening_close(dest, day=None):
         desc.append(f"No session activity logged · {daily['kpis']['commits']} commits · {len(merged)} merged / {len(touched)} open")
     e = discord.Embed(title=f"🌙 Evening Close — {jal}", description="\n".join(desc), color=color)
 
-    if meetings:
-        e.add_field(name="🤝 Meetings today", value="\n".join(f"• {t}" for t in meetings)[:1024], inline=False)
+    # The model's reply is EXACTLY two sections (enforced by the prompt): real Calendar meetings
+    # with Tehran-converted duration, then the plan-vs-actual task map. Split on the TASKMAP:
+    # header rather than trust the model to keep them in separate messages.
+    raw = (result or "").strip()
+    if "TASKMAP:" in raw:
+        meetings_part, taskmap_part = raw.split("TASKMAP:", 1)
+        meetings_part = meetings_part.replace("MEETINGS:", "", 1).strip()
+    else:
+        meetings_part, taskmap_part = "", raw
+    if meetings_part and meetings_part != "No meetings today.":
+        e.add_field(name="🤝 Meetings today", value=meetings_part[:1024], inline=False)
+    elif vault_meetings:
+        # Calendar found nothing (or the tool call failed) but a vault note exists for today —
+        # surface it rather than silently show no meetings at all.
+        e.add_field(name="🤝 Meetings today (from vault notes)", value="\n".join(f"• {t}" for t in vault_meetings)[:1024], inline=False)
 
     # Primary content: the model's plan-vs-actual read of today's real conversations, not a
     # mechanical ledger dump. Trusted verbatim — its own instructions constrain the format tightly.
-    taskmap = (result or "").strip() or "_(no task map produced)_"
+    taskmap = taskmap_part.strip() or "_(no task map produced)_"
     e.add_field(name="🗺️ Task Map", value=taskmap[:1024], inline=False)
 
     if daily["commits"]:
