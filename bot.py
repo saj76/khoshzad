@@ -235,7 +235,7 @@ def mr_ref(m):
     return (m.get("references") or {}).get("full") or f"!{m.get('iid', '?')}"
 
 
-def build_evening_prompt(day, jal, rel, commits, merged_mrs, touched_mrs, transcripts_block):
+def build_evening_prompt(day, jal, rel, commits, merged_mrs, touched_mrs, transcripts_block, review_notes, vault_reviews):
     lines = [f"Reconcile today's Obsidian worklog AND map it against what actually happened today. "
              f"Today is {day.isoformat()} = Jalali {jal} (his work week is Sunday–Thursday).",
              f"Worklog file, relative to the vault root {VAULT}: `{rel}`",
@@ -246,6 +246,16 @@ def build_evening_prompt(day, jal, rel, commits, merged_mrs, touched_mrs, transc
     lines += [f"- {mr_ref(m)} {m['title']}" for m in merged_mrs] if merged_mrs else ["- (none)"]
     lines += ["", "MRs opened/updated today, not yet merged:"]
     lines += [f"- {mr_ref(m)} {m['title']} ({m['state']})" for m in touched_mrs] if touched_mrs else ["- (none)"]
+    lines += ["", "His own code review activity today — real comments/approvals he wrote on colleagues' MRs "
+                   "(from GitLab, not a guess):"]
+    if review_notes:
+        for rn in review_notes:
+            kind = "approved" if rn["system"] else "commented"
+            lines.append(f"- {rn['mr']} {rn['title']} — {kind}: \"{rn['body']}\"")
+    else:
+        lines.append("- (none)")
+    if vault_reviews:
+        lines.append(f"He also wrote/updated review notes in the vault's Reviews/ folder today: {', '.join(vault_reviews)}")
     lines += ["", "Condensed transcripts of today's substantial sessions — his messages and the assistant's replies, "
                    "real content, not just topic labels. This is what he actually worked on, discussed, or "
                    "investigated today, use it to know what really happened:", "", transcripts_block]
@@ -274,8 +284,12 @@ def build_evening_prompt(day, jal, rel, commits, merged_mrs, touched_mrs, transc
         "   ✅ <task text, short> — <one clause: what actually got done>\n"
         "   🔸 <task text, short> — in progress: <one clause: what happened, what's left>\n"
         "   ➖ <task text, short> — no activity today\n"
-        "   If substantial work happened that matches NO planned line, add a final block (blank line before it) "
-        "of 🆕 lines, same one-clause style, for that unplanned work only.\n"
+        "   Code review is a real day activity, not a footnote — if his review comments/approvals above match a "
+        "planned line (e.g. 'review X's MR'), fold it into that line's ✅/🔸 clause using what he actually wrote, "
+        "not just 'reviewed it'. If no planned line covers it, it still counts as substantial work.\n"
+        "   If substantial work happened that matches NO planned line — including review activity above with no "
+        "matching line — add a final block (blank line before it) of 🆕 lines, same one-clause style, for that "
+        "unplanned work only.\n"
         f"8. Separately, call the calendar tool ({', '.join(CALENDAR_TOOLS)}) for calendar_id=primary, "
         f"user_google_email={GOOGLE_EMAIL}, bounded to {day.isoformat()}T00:00:00+03:30 through "
         f"{(day + dt.timedelta(1)).isoformat()}T00:00:00+03:30. The tool returns times in whatever timezone each "
@@ -350,11 +364,51 @@ def fetch_reviewer_mrs(root, since_date):
     return []
 
 
+def fetch_review_notes_today(root, mrs, today_iso):
+    """His own real review comments/approvals today on MRs where he's a reviewer — the actual
+    content of a review, not just 'he's assigned as reviewer' (that's what fetch_reviewer_mrs
+    already gives). One extra API call per MR, bounded to the MRs already identified as touched
+    by his review activity that day, so this stays cheap."""
+    anchors = wr.repos_under(root)
+    if not anchors:
+        return []
+    out = []
+    for m in mrs:
+        pid, iid = m.get("project_id"), m.get("iid")
+        if not pid or not iid:
+            continue
+        try:
+            raw = subprocess.run(["glab", "api", f"projects/{pid}/merge_requests/{iid}/notes?per_page=100"],
+                                 cwd=anchors[0], capture_output=True, text=True, timeout=30).stdout
+            notes = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(notes, list):
+            continue
+        for n in notes:
+            if (n.get("author") or {}).get("username") != GITLAB_USER:
+                continue
+            if wr.tehran_date(n.get("created_at") or "") != today_iso:
+                continue
+            body = (n.get("body") or "").strip()
+            if body:
+                out.append(dict(mr=mr_ref(m), title=m["title"], body=body[:280], system=bool(n.get("system"))))
+    return out
+
+
+def vault_reviews_today(today_iso):
+    """Review note files under Reviews/ in the vault that he touched today, via git log — his own
+    written record of a review, cross-referenced against the GitLab-side signal above."""
+    out = subprocess.run(["git", "-C", str(VAULT), "log", f"--since={today_iso}T00:00:00+03:30",
+                          f"--until={today_iso}T23:59:59+03:30", "--name-only", "--pretty=", "--", "Reviews/"],
+                         capture_output=True, text=True).stdout
+    return sorted({p.strip() for p in out.splitlines() if p.strip()})
+
+
 def meetings_today(month_folder, jal):
-    """Meeting note titles for today, from the vault — not a duration. No meeting note in the
-    vault records start/end time, so this is visibility only; a real per-meeting duration would
-    need the Google Calendar connector (claude.ai connector settings — his authorization, not
-    something this box can do unattended)."""
+    """Meeting note titles for today, from the vault — a cross-check/fallback alongside the real
+    Google Calendar durations in the MEETINGS section of the model's reply (build_evening_prompt
+    step 8); shown only when Calendar found nothing, since no meeting note records duration."""
     mdir = VAULT / month_folder / "Meetings"
     if not mdir.is_dir():
         return []
@@ -421,9 +475,11 @@ async def run_evening_close(dest, day=None):
         review_hours = review_hours_today(daily, msgs, since)
         reviewing = [x for x in await asyncio.to_thread(fetch_reviewer_mrs, str(ROOT), since)
                     if wr.tehran_date(x.get("updated_at") or "") == since and (x.get("author") or {}).get("username") != GITLAB_USER]
+        review_notes = await asyncio.to_thread(fetch_review_notes_today, str(ROOT), reviewing, since)
+        vault_reviews = await asyncio.to_thread(vault_reviews_today, since)
         vault_meetings = meetings_today(jalali.folder_name(m), jal)
         before = await asyncio.to_thread(vault_head)
-        prompt = build_evening_prompt(day, jal, rel, commits, merged, touched, transcripts_for(daily, msgs, since))
+        prompt = build_evening_prompt(day, jal, rel, commits, merged, touched, transcripts_for(daily, msgs, since), review_notes, vault_reviews)
         async with dest.typing():
             result, err = await claude_run(prompt, VAULT_WRITE_TOOLS + CALENDAR_TOOLS, QA_TIMEOUT, BOT_DIR, extra=["--append-system-prompt", EVENING_SYSTEM_PROMPT])
         after = await asyncio.to_thread(vault_head)
