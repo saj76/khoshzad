@@ -74,7 +74,14 @@ the self-report" discipline the workspace uses for dev-agent review.
   `claude -p` only the judgment call: reconcile the checklist, create the file if it
   doesn't exist, commit, push. Tools are scoped to `Read/Write/Edit/Glob` plus git
   commands *restricted to the vault path* — it cannot touch another repo or run an
-  arbitrary git command.
+  arbitrary git command. The chart's BF/AP/FD/WD split carves review time out into
+  its own line (`review_wall_split`) instead of leaving it inside whichever category
+  the session was classified as — grounded in real GitLab reviewer-role MR numbers
+  (`!1607`) appearing in the session, not a keyword match: this workspace's own
+  product is a code-review pipeline, so keyword matching on "review" badly
+  over-counted (one real day hit 100% "review" purely from mentioning `/code-review`,
+  its own routine self-review step, nowhere near what he'd actually spent reviewing
+  someone else's code).
 - **Brag document** (`run_brag`): reads that week's `metrics.json` (+ `narrative.html`
   for numbers/quotes already on record) and appends lines to `Brag/1405.md` under
   Evans' sections (Projects · Collaboration & mentorship · Design & documentation ·

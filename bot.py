@@ -333,19 +333,38 @@ def session_excerpt(msgs, sid, today_iso, max_msgs=14, max_chars=900):
     return "\n".join(lines)
 
 
-REVIEW_PATTERN = re.compile(r"/code-review\b|/peer-review\b|/coderabbit-review\b|review this|please review|code review|reviewed by|\bLGTM\b|approve this|review round|review comments", re.I)
+def review_wall_split(daily, msgs, today_iso, reviewer_mrs):
+    """Wall-clock minutes attributable to REAL review activity, carved OUT of whichever BF/AP/FD/WD
+    bucket each matching ledger row was classified into — so the chart shows review as its own line
+    instead of silently inflating one of the four categories.
 
-
-def review_hours_today(daily, msgs, today_iso):
-    """Cross-cutting, not a fifth category: a review session still keeps its BF/AP/FD/WD tag —
-    this is 'of those hours, how many went to reviewing someone else's work', approximated at the
-    whole-session grain (a session is or isn't a review session; not split mid-session)."""
-    total = 0.0
+    Deliberately NOT a keyword match on session text (that was the first attempt, and it badly
+    over-counted: this workspace's own product IS a code-review pipeline, so a session about
+    building /code-review, review lenses, or 'review rounds' in the Shopify Flow pipeline is full
+    of review vocabulary without him personally reviewing anyone's code — it inflated 3 of 4 test
+    days to 85-100% 'review', including one at 100% with zero commits explaining it). Grounded
+    instead in real GitLab reviewer-role MR numbers (`reviewer_mrs`, author-excluded, from
+    fetch_reviewer_mrs — no day filter, since a real review pass on an MR doesn't always land on
+    the exact calendar day GitLab stamps as its last `updated_at`): a row counts as review only if
+    its session text names one of those MR refs (`!1607`) verbatim. Reviewing done purely in the
+    GitLab UI with no Claude session leaves no ledger row to carve from, and correctly contributes
+    zero session time here — this only redistributes minutes that already exist in the ledger."""
+    refs = {f"!{m['iid']}" for m in reviewer_mrs if m.get("iid")}
+    wall = dict(daily["wall"])
+    if not refs:
+        return wall, 0.0
+    pattern = re.compile("|".join(re.escape(r) + r"\b" for r in refs))
+    review_min_by_cat = collections.Counter()
     for r in daily["ledger"]:
         text = " ".join(m["text"] for sid in r["sids"] for m in msgs if m["sid"] == sid and m["d"] == today_iso)
-        if REVIEW_PATTERN.search(text):
-            total += r["hours"]
-    return total
+        if pattern.search(text):
+            review_min_by_cat[r["cat"]] += r["hours"] * 60
+    review_min = 0.0
+    for cat, mins in review_min_by_cat.items():
+        take = min(mins, wall.get(cat, 0))
+        wall[cat] = wall.get(cat, 0) - take
+        review_min += take
+    return wall, review_min
 
 
 def fetch_reviewer_mrs(root, since_date):
@@ -503,7 +522,7 @@ def bar_ascii(pct, width=14):
     return "█" * filled + "░" * (width - filled)
 
 
-def category_block(wall, tot):
+def category_block(wall, tot, review_min=0):
     if tot <= 1e-6:
         return None
     lines = []
@@ -513,6 +532,9 @@ def category_block(wall, tot):
             continue
         pct = v / tot * 100
         lines.append(f"{wr.SHORT[c]:<3}{bar_ascii(pct)} {pct:>3.0f}%  {wr.h(v / 60)}")
+    if review_min > 1e-6:
+        pct = review_min / tot * 100
+        lines.append(f"{'RV':<3}{bar_ascii(pct)} {pct:>3.0f}%  {wr.h(review_min / 60)}")
     return "\n".join(lines)
 
 
@@ -545,9 +567,10 @@ async def run_evening_close(dest, day=None):
         # filter mrs_all directly rather than reuse daily["mrs"].
         merged = [x for x in mrs_all if wr.tehran_date(x.get("merged_at") or "") == since]
         touched = [x for x in mrs_all if x.get("state") == "opened" and wr.tehran_date(x.get("updated_at") or "") == since]
-        review_hours = review_hours_today(daily, msgs, since)
-        reviewing = [x for x in await asyncio.to_thread(fetch_reviewer_mrs, str(ROOT), since)
-                    if wr.tehran_date(x.get("updated_at") or "") == since and (x.get("author") or {}).get("username") != GITLAB_USER]
+        mrs_reviewer = [x for x in await asyncio.to_thread(fetch_reviewer_mrs, str(ROOT), since)
+                        if (x.get("author") or {}).get("username") != GITLAB_USER]
+        reviewing = [x for x in mrs_reviewer if wr.tehran_date(x.get("updated_at") or "") == since]
+        adj_wall, review_min = review_wall_split(daily, msgs, since, mrs_reviewer)
         review_notes = await asyncio.to_thread(fetch_review_notes_today, str(ROOT), reviewing, since)
         vault_reviews = await asyncio.to_thread(vault_reviews_today, since)
         vault_meetings = meetings_today(jalali.folder_name(m), jal)
@@ -576,14 +599,8 @@ async def run_evening_close(dest, day=None):
     desc = [f"**{day.strftime('%A, %d %B')}**"]
     if tot > 1e-6:
         line = f"{tot/60:.1f}h active · {daily['kpis']['sessions']} sessions · {daily['kpis']['commits']} commits · {len(merged)} merged / {len(touched)} open"
-        if review_hours > 0.01:
-            # review_hours is raw per-session engagement time (can overlap across concurrent
-            # sessions, same "engagement vs. wall-clock" distinction the weekly report discloses
-            # in its Method section) — clamped to the wall-clock ceiling so it can never read as
-            # bigger than "active hours" on the same line, and marked ~ since it's an approximation.
-            line += f" · 🔎 ~{wr.h(min(review_hours, tot / 60))} reviewing"
         desc.append(line)
-        cat = category_block(daily["wall"], tot)
+        cat = category_block(adj_wall, tot, review_min)
         if cat:
             desc.append(f"```\n{cat}\n```")
     else:
