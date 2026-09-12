@@ -657,7 +657,10 @@ async def run_evening_close(dest, day=None):
 
     # Primary content: the model's plan-vs-actual read of today's real conversations, not a
     # mechanical ledger dump. Trusted verbatim — its own instructions constrain the format tightly.
-    taskmap = taskmap_part.strip() or "_(no task map produced)_"
+    # One line per item per the prompt, so a blank line between every non-empty line reliably
+    # spaces the whole list without depending on the model to add spacing itself.
+    lines = [l for l in taskmap_part.strip().splitlines() if l.strip()]
+    taskmap = "\n\n".join(lines) if lines else "_(no task map produced)_"
     e.add_field(name="🗺️ Task Map", value=taskmap[:1024], inline=False)
 
     if daily["commits"]:
