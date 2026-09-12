@@ -81,7 +81,12 @@ the self-report" discipline the workspace uses for dev-agent review.
   product is a code-review pipeline, so keyword matching on "review" badly
   over-counted (one real day hit 100% "review" purely from mentioning `/code-review`,
   its own routine self-review step, nowhere near what he'd actually spent reviewing
-  someone else's code).
+  someone else's code). Review done with no Claude session at all (reading a
+  colleague's PR or Sentry dashboard directly) leaves no ledger row for GitLab-ref
+  matching to find — for that, `vault_worklog_review_minutes` picks up an explicit
+  `(start: HH:MM, end: HH:MM)` block he hand-writes on a checked, review-worded main
+  task, and adds it as genuinely new time (to both the review bucket and the day's
+  total), not a redistribution of existing minutes.
 - **Brag document** (`run_brag`): reads that week's `metrics.json` (+ `narrative.html`
   for numbers/quotes already on record) and appends lines to `Brag/1405.md` under
   Evans' sections (Projects · Collaboration & mentorship · Design & documentation ·

@@ -367,6 +367,35 @@ def review_wall_split(daily, msgs, today_iso, reviewer_mrs):
     return wall, review_min
 
 
+VAULT_TIME_BLOCK = re.compile(r"\(start:\s*(\d{1,2}):(\d{2})\s*,\s*end:\s*(\d{1,2}):(\d{2})\)", re.I)
+
+
+def vault_worklog_review_minutes(rel):
+    """Real review time he logged by hand with an explicit '(start: HH:MM, end: HH:MM)' block on a
+    checked, review-worded main-task line — activity with NO Claude session behind it at all (he
+    read a colleague's PR or Sentry dashboard directly), so review_wall_split can never find it:
+    there is no ledger row to carve it from, and it isn't in daily['wall'] either. Confirmed from
+    two real lines (1405-06-12, 1405-06-18), both 'Review <name>'s work on ...' with this exact
+    annotation and no matching session — the only record of that time is the worklog itself. Adds
+    genuinely new wall-clock minutes (to both the review bucket and the day's total), rather than
+    redistributing existing ones."""
+    p = VAULT / rel
+    if not p.is_file():
+        return 0.0
+    total = 0.0
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not re.match(r"-\s\[[xX]\]", line) or not re.search(r"\breview", line, re.I):
+            continue
+        m = VAULT_TIME_BLOCK.search(line)
+        if m:
+            sh, sm, eh, em = map(int, m.groups())
+            mins = (eh * 60 + em) - (sh * 60 + sm)
+            if mins > 0:
+                total += mins
+    return total
+
+
 def fetch_reviewer_mrs(root, since_date):
     """MRs where he's a reviewer (not author) touched today — GitLab ground truth, independent of
     what any session transcript says. Mirrors wr.fetch_mrs()'s shape but a different API scope
@@ -586,6 +615,9 @@ async def run_evening_close(dest, day=None):
     changed = after != before
     added = await asyncio.to_thread(vault_diff_added_lines, before, after, rel) if changed else []
     tot = sum(daily["wall"].values())
+    vault_review_min = await asyncio.to_thread(vault_worklog_review_minutes, rel)
+    review_min += vault_review_min
+    tot += vault_review_min
 
     if pushed is False:
         color = discord.Color.orange()
