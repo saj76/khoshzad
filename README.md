@@ -40,7 +40,7 @@ journalctl --user -u weekly-bot -f    # expect: "ready as <bot> · owner … · 
 | Command | Does |
 |---|---|
 | `/weekly [sunday]` | Full report for that week (default: current). Posts the embed + `report.html`, then auto-chains `/brag` and `/snippet` for the same week. |
-| `/brief [date]` | Morning brief for that date (default: today). On the live default run, if today's worklog page doesn't exist yet it's created in your own `Main tasks:` format — seeded with yesterday's unfinished main tasks, exactly what you'd retype by hand — and pushed. Then shows the plan, your open-reviewer-MR queue (only MRs opened within the last week — older ones are stale backlog, not "waiting on you"), and a Jira lookup scoped to keys mentioned in your own conversations or worklog over the last two work days (not a blanket "everything assigned to me" query). A manual `/brief <past-date>` never creates a file — read-only in that case. |
+| `/brief [date]` | Morning brief for that date (default: today). On the live default run, if today's worklog page doesn't exist yet it's created in your own `Main tasks:` format — seeded with yesterday's unfinished main tasks, exactly what you'd retype by hand — and pushed. Then shows the plan, your open-reviewer-MR queue (only MRs opened within the last week — older ones are stale backlog, not "waiting on you"), and a Jira lookup scoped to keys mentioned in your own conversations or worklog over the last two work days (not a blanket "everything assigned to me" query), further filtered to only the ones actually in **Product/Tech Check-in** status — that's the only status that's really your turn; QA PASSED, Pending Customer Response, To Do and everything else is silently skipped. A manual `/brief <past-date>` never creates a file — read-only in that case. |
 | `/close [date]` | Evening close for that date (default: today). Reconciles the day's worklog against real commits/MRs, ticks what's supported, appends unplanned work, pushes to the vault, posts a diff embed. |
 | `/brag [sunday]` | Append evidence-backed wins to `Brag/1405.md` in the vault, under Julia Evans' sections. Requires that week's report to exist. |
 | `/snippet [sunday]` | Post a short Persian شد/آموختم/بعدی/گیر کردم update — Discord only, nothing written to the vault. |
@@ -74,7 +74,9 @@ the self-report" discipline the workspace uses for dev-agent review.
   last two work days (`wr.KEY`, the same `RS-\d{4}` pattern the weekly report uses) — no keys
   found means no Jira call at all. When there are keys, the one thing that needs `claude -p` is
   fetching each one's real current status via `mcp__atlassian__getJiraIssue` — a narrow, read-only
-  tool call per key, not a judgment call.
+  tool call per key, not a judgment call. The reply only lists a key whose CURRENT status is
+  exactly **Product/Tech Check-in** — everything else (QA PASSED, Pending Customer Response, To
+  Do, ...) means it's already handled or not his turn yet, and is dropped silently.
 - **Evening close** (`run_evening_close`): resolves today's Jalali date (`jalali.py`,
   1405 anchor table), pre-fetches today's commits and MRs itself (reusing
   `weekly_report.py`'s `commits()`/`fetch_mrs()` — one source of truth), and hands

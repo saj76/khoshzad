@@ -792,11 +792,15 @@ ATLASSIAN_TOOLS = ["mcp__atlassian__getAccessibleAtlassianResources", "mcp__atla
 
 MORNING_SYSTEM_PROMPT = (
     "You are running unattended from a Discord bot's morning-brief job. Read-only: do not create, "
-    "edit, comment on, or transition any Jira issue. Reply with EXACTLY one short bullet list, no "
-    "preamble, no markdown headers — one line per issue as `KEY status — summary`, prefixed with ⏳ "
-    "if the status mentions customer/waiting/pending. Report only the keys you were given — never "
-    "add others from a broader search or from memory. If none of the given keys resolve, reply "
-    "exactly: No Jira issues mentioned in the last two days."
+    "edit, comment on, or transition any Jira issue. Only an issue whose CURRENT status is exactly "
+    "'Product/Tech Check-in' (case-insensitive) is actually waiting on him — that is the only status "
+    "worth surfacing here. Every other status means it's already been checked and handed off "
+    "(e.g. QA PASSED), or it isn't his turn yet (e.g. Pending Customer Response, To Do) — skip those "
+    "entirely, do not list them even to say they're waiting on someone else. Reply with EXACTLY one "
+    "short bullet list, no preamble, no markdown headers — one line per matching issue as "
+    "`KEY — summary`. Report only among the keys you were given — never add others from a broader "
+    "search or from memory. If none of the given keys are in that status, reply exactly: "
+    "No issues waiting on you right now."
 )
 
 
