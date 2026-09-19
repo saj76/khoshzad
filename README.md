@@ -4,8 +4,10 @@ Khoshzad (خوش‌زاد) is Sajjad's personal Discord bot. Runs on the dev box
 `systemd --user` service `weekly-bot` — the service, directory and repo keep the plain
 functional name; the bot's persona in conversation is Khoshzad. Owner-only. Answers and
 write-mode jobs come from headless `claude -p` on your own subscription. Schedule:
-**morning brief** Sun–Thu 08:00, **evening close** Sun–Thu 17:30, **weekly report +
-brag document + snippet** Thu 19:00 — all Asia/Tehran.
+**morning brief** Sun–Thu 10:00, **evening close** Sun–Thu 17:30, **weekly report +
+brag document + snippet** Thu 19:00 — all Asia/Tehran, all configurable via
+`MORNING_HOUR`/`MORNING_MINUTE`, `EVENING_HOUR`/`EVENING_MINUTE`, `POST_DOW`/`POST_HOUR`
+in `~/.config/weekly-bot/.env` (see `env.example`).
 
 ## One-time setup (you)
 
@@ -38,7 +40,7 @@ journalctl --user -u weekly-bot -f    # expect: "ready as <bot> · owner … · 
 | Command | Does |
 |---|---|
 | `/weekly [sunday]` | Full report for that week (default: current). Posts the embed + `report.html`, then auto-chains `/brag` and `/snippet` for the same week. |
-| `/brief [date]` | Morning brief for that date (default: today). On the live default run, if today's worklog page doesn't exist yet it's created in your own `Main tasks:` format — seeded with yesterday's unfinished main tasks, exactly what you'd retype by hand — and pushed. Then shows the plan, your full open-reviewer-MR queue (flagged past 24h), and a live Jira lookup for open issues assigned to you. A manual `/brief <past-date>` never creates a file — read-only in that case. |
+| `/brief [date]` | Morning brief for that date (default: today). On the live default run, if today's worklog page doesn't exist yet it's created in your own `Main tasks:` format — seeded with yesterday's unfinished main tasks, exactly what you'd retype by hand — and pushed. Then shows the plan, your open-reviewer-MR queue (only MRs opened within the last week — older ones are stale backlog, not "waiting on you"), and a Jira lookup scoped to keys mentioned in your own conversations or worklog over the last two work days (not a blanket "everything assigned to me" query). A manual `/brief <past-date>` never creates a file — read-only in that case. |
 | `/close [date]` | Evening close for that date (default: today). Reconciles the day's worklog against real commits/MRs, ticks what's supported, appends unplanned work, pushes to the vault, posts a diff embed. |
 | `/brag [sunday]` | Append evidence-backed wins to `Brag/1405.md` in the vault, under Julia Evans' sections. Requires that week's report to exist. |
 | `/snippet [sunday]` | Post a short Persian شد/آموختم/بعدی/گیر کردم update — Discord only, nothing written to the vault. |
@@ -64,10 +66,15 @@ the self-report" discipline the workspace uses for dev-agent review.
   task carried from the last work day (`unfinished_main_tasks`, which excludes evening close's own
   `(session)`/`(unplanned)` log entries — confirmed from his real history that only the untagged
   bullets get retyped by hand each morning), then commits and pushes — mechanical, no model
-  involved. Never overwrites a file he already wrote. Your full open-reviewer MR queue comes from
-  GitLab (`open_reviewer_mrs`, age = time since the MR was opened, flagged 🔴 past 24h). The one
-  thing that needs `claude -p` is the live Jira lookup (`assignee = currentUser() AND
-  statusCategory != Done`) via the Atlassian MCP — a narrow, read-only tool call, not a judgment call.
+  involved. Never overwrites a file he already wrote. Your open-reviewer MR queue comes from
+  GitLab (`open_reviewer_mrs`, filtered to the last 7 days — an older MR isn't "waiting on you"
+  in any useful sense, it's stale backlog — age = time since the MR was opened, flagged 🔴 past
+  24h). Jira is scoped, not a blanket query: `jira_keys_from_recent` pulls today's real Jira keys
+  only from ones actually mentioned in his own session transcripts or Obsidian worklog over the
+  last two work days (`wr.KEY`, the same `RS-\d{4}` pattern the weekly report uses) — no keys
+  found means no Jira call at all. When there are keys, the one thing that needs `claude -p` is
+  fetching each one's real current status via `mcp__atlassian__getJiraIssue` — a narrow, read-only
+  tool call per key, not a judgment call.
 - **Evening close** (`run_evening_close`): resolves today's Jalali date (`jalali.py`,
   1405 anchor table), pre-fetches today's commits and MRs itself (reusing
   `weekly_report.py`'s `commits()`/`fetch_mrs()` — one source of truth), and hands

@@ -47,7 +47,7 @@ POST_HOUR = int(os.environ.get("POST_HOUR", "19"))
 EVENING_HOUR = int(os.environ.get("EVENING_HOUR", "17"))
 EVENING_MINUTE = int(os.environ.get("EVENING_MINUTE", "30"))
 EVENING_DOWS = {6, 0, 1, 2, 3}  # Sun–Thu (Python weekday: Mon=0 … Sun=6)
-MORNING_HOUR = int(os.environ.get("MORNING_HOUR", "8"))
+MORNING_HOUR = int(os.environ.get("MORNING_HOUR", "10"))
 MORNING_MINUTE = int(os.environ.get("MORNING_MINUTE", "0"))
 QA_TIMEOUT = int(os.environ.get("QA_TIMEOUT", "240"))
 WEEKLY_TIMEOUT = int(os.environ.get("WEEKLY_TIMEOUT", "2400"))
@@ -788,25 +788,45 @@ async def run_snippet(dest, week):
 
 
 # ---------------------------------------------------------------- morning brief
-ATLASSIAN_TOOLS = ["mcp__atlassian__getAccessibleAtlassianResources", "mcp__atlassian__searchJiraIssuesUsingJql"]
+ATLASSIAN_TOOLS = ["mcp__atlassian__getAccessibleAtlassianResources", "mcp__atlassian__getJiraIssue"]
 
 MORNING_SYSTEM_PROMPT = (
     "You are running unattended from a Discord bot's morning-brief job. Read-only: do not create, "
     "edit, comment on, or transition any Jira issue. Reply with EXACTLY one short bullet list, no "
     "preamble, no markdown headers — one line per issue as `KEY status — summary`, prefixed with ⏳ "
-    "if the status mentions customer/waiting/pending. If there are none, reply exactly: "
-    "No open Jira issues assigned to you."
+    "if the status mentions customer/waiting/pending. Report only the keys you were given — never "
+    "add others from a broader search or from memory. If none of the given keys resolve, reply "
+    "exactly: No Jira issues mentioned in the last two days."
 )
 
 
-def build_morning_prompt(jal, day):
+def build_morning_prompt(jal, day, jira_keys):
+    keys_str = ", ".join(sorted(jira_keys))
     return (
-        f"Morning brief for {jal} ({day.strftime('%A, %d %B')}). Find my current open Jira work:\n"
+        f"Morning brief for {jal} ({day.strftime('%A, %d %B')}). These Jira keys were mentioned in "
+        f"my own conversations or Obsidian worklog over the last two work days: {keys_str}\n"
         "1. Call mcp__atlassian__getAccessibleAtlassianResources to get the cloudId for partnerz.atlassian.net.\n"
-        "2. Call mcp__atlassian__searchJiraIssuesUsingJql with that cloudId and JQL: "
-        "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC\n"
+        "2. Call mcp__atlassian__getJiraIssue for EACH key above with that cloudId, to get its real "
+        "current status, priority and summary — never guess or reuse anything from the mention itself.\n"
         "3. Report every issue found per the reply format in your system prompt."
     )
+
+
+def jira_keys_from_recent(msgs, day1_iso, day2_iso, worklog_paths):
+    """Jira keys mentioned in his own conversations or Obsidian worklog over the last two work
+    days — grounds the morning brief's Jira section in what he's actually been working on, instead
+    of a blanket 'everything assigned to me' JQL query that surfaces stale backlog tickets he
+    hasn't touched in weeks."""
+    keys = set()
+    norm = lambda k: "RS-" + re.sub(r"\D", "", k)
+    for m in msgs:
+        if m["d"] in (day1_iso, day2_iso):
+            keys.update(norm(k) for k in wr.KEY.findall(m["text"]))
+    for p in worklog_paths:
+        fp = VAULT / p
+        if fp.is_file():
+            keys.update(norm(k) for k in wr.KEY.findall(fp.read_text(encoding="utf-8")))
+    return keys
 
 
 async def run_morning_brief(dest, day=None):
@@ -839,13 +859,25 @@ async def run_morning_brief(dest, day=None):
 
         today_items = worklog_checklist(rel)
 
+        # A queue past a week old is almost never still "waiting on you" in any useful sense —
+        # it's stale backlog, and it drowned out the real recent items (observed: MRs 200+ days
+        # old sorting to the top by age).
         reviewing = await asyncio.to_thread(open_reviewer_mrs, str(ROOT))
+        reviewing = [mr for mr in reviewing if mr_age_hours(mr) <= 24 * 7]
         reviewing.sort(key=mr_age_hours, reverse=True)
 
-        prompt = build_morning_prompt(jal, day)
-        async with dest.typing():
-            jira_text, err = await claude_run(prompt, ATLASSIAN_TOOLS, QA_TIMEOUT, BOT_DIR,
-                                               extra=["--append-system-prompt", MORNING_SYSTEM_PROMPT])
+        d2 = prev_workday(prev_workday(day))
+        _, pm2, pd2 = jalali.greg_to_jalali(d2)
+        msgs, _steps = wr.load_sessions(str(ROOT / "notify-me-workspace" / "logs"))
+        jira_keys = jira_keys_from_recent(msgs, prev_workday(day).isoformat(), d2.isoformat(),
+                                           [jalali.file_rel(pm, pd), jalali.file_rel(pm2, pd2)])
+        if jira_keys:
+            prompt = build_morning_prompt(jal, day, jira_keys)
+            async with dest.typing():
+                jira_text, err = await claude_run(prompt, ATLASSIAN_TOOLS, QA_TIMEOUT, BOT_DIR,
+                                                   extra=["--append-system-prompt", MORNING_SYSTEM_PROMPT])
+        else:
+            jira_text, err = "No Jira issues mentioned in the last two days.", None
 
     e = discord.Embed(title=f"☀️ Morning Brief — {jal}", description=f"**{day.strftime('%A, %d %B')}**", color=discord.Color.gold())
 
